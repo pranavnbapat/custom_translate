@@ -1,6 +1,7 @@
 # main.py
 
 import logging
+import os
 import time
 
 from datetime import datetime, timezone
@@ -9,6 +10,8 @@ from easynmt import EasyNMT
 from fastapi import FastAPI
 from langdetect import detect, LangDetectException
 from pydantic import BaseModel
+
+import nltk
 
 from fastapi import HTTPException
 from starlette.concurrency import run_in_threadpool
@@ -23,6 +26,25 @@ MODEL_NAMES = {"m2m_100_418M", "m2m_100_1.2B"}
 
 # Cache models on first use instead of loading everything at import time.
 _MODEL_CACHE: dict[str, EasyNMT] = {}
+
+def ensure_nltk() -> None:
+    """
+    EasyNMT may require NLTK resources (e.g. punkt_tab) for sentence tokenisation.
+    Ensure they're present at startup to avoid 500s at first request.
+    """
+    # Prefer a project-local NLTK data dir if provided
+    nltk_data_dir = os.getenv("NLTK_DATA")
+    if nltk_data_dir:
+        os.makedirs(nltk_data_dir, exist_ok=True)
+        # Ensure NLTK also searches this directory
+        if nltk_data_dir not in nltk.data.path:
+            nltk.data.path.insert(0, nltk_data_dir)
+
+    try:
+        nltk.data.find("tokenizers/punkt_tab/english/")
+    except LookupError:
+        LOG.info("NLTK resource 'punkt_tab' missing; downloading now...")
+        nltk.download("punkt_tab", download_dir=nltk_data_dir or None, quiet=True)
 
 def get_model(model_name: str) -> EasyNMT:
     """
@@ -44,9 +66,9 @@ def get_model(model_name: str) -> EasyNMT:
     _MODEL_CACHE[model_name] = m
     return m
 
-
-
 app = FastAPI()
+
+ensure_nltk()
 
 class TranslateRequest(BaseModel):
     text: str

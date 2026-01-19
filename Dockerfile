@@ -27,3 +27,5 @@ EXPOSE 8000
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000", "--proxy-headers","--forwarded-allow-ips","*", "--timeout-keep-alive","120"]
+
+# uvicorn main:app --reload --host 0.0.0.0 --port 8000
