@@ -11,6 +11,7 @@ from langdetect import detect, LangDetectException
 from pydantic import BaseModel
 
 from fastapi import HTTPException
+from starlette.concurrency import run_in_threadpool
 
 
 logging.basicConfig(level=logging.INFO)
@@ -18,12 +19,31 @@ logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "m2m_100_418M"
-AVAILABLE_MODELS = {
-    "m2m_100_418M": EasyNMT("m2m_100_418M"),
-    "m2m_100_1.2B": EasyNMT("m2m_100_1.2B"),
-}
+MODEL_NAMES = {"m2m_100_418M", "m2m_100_1.2B"}
 
-model = AVAILABLE_MODELS[DEFAULT_MODEL_NAME]
+# Cache models on first use instead of loading everything at import time.
+_MODEL_CACHE: dict[str, EasyNMT] = {}
+
+def get_model(model_name: str) -> EasyNMT:
+    """
+    Lazy-load and cache EasyNMT models to reduce startup time and memory/VRAM usage.
+    """
+    if model_name not in MODEL_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{model_name}'. Available: {', '.join(sorted(MODEL_NAMES))}",
+        )
+
+    cached = _MODEL_CACHE.get(model_name)
+    if cached is not None:
+        return cached
+
+    LOG.info("Loading EasyNMT model: %s", model_name)
+    # Use CUDA if available; EasyNMT will fall back to CPU if not.
+    m = EasyNMT(model_name, device="cuda")
+    _MODEL_CACHE[model_name] = m
+    return m
+
 
 
 app = FastAPI()
@@ -40,53 +60,28 @@ class TranslateRequest(BaseModel):
 @app.post("/translate")
 async def translate(req: TranslateRequest):
     # Decide which model to use
-    model_name = req.model or DEFAULT_MODEL_NAME
-    if model_name not in AVAILABLE_MODELS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown model '{model_name}'. "
-                   f"Available: {', '.join(AVAILABLE_MODELS.keys())}"
-        )
-
-    chosen_model = AVAILABLE_MODELS[model_name]
+    # Decide which model to use (lazy-load)
+    model_name = (req.model or DEFAULT_MODEL_NAME).strip()
+    chosen_model = get_model(model_name)
 
     # Start from any explicit source/target in the request
     source_lang = req.source_lang.lower() if req.source_lang else None
     target_lang = req.target_lang.lower() if req.target_lang else None
 
-    # Case A: both source and target are provided -> verify source matches detected
+    # Case A: both source and target are provided -> trust the caller
     if source_lang and target_lang:
-        try:
-            detected_lang = detect(req.text)
-        except LangDetectException:
-            raise HTTPException(
-                status_code=400,
-                detail="Could not detect language of input text."
-            )
-
-        LOG.info("Detected language: %s, requested source_lang: %s", detected_lang, source_lang)
-        if detected_lang.lower() != source_lang:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Detected language '{detected_lang}' does not match "
-                    f"given source_lang '{source_lang}'."
-                ),
-            )
-
-        # source_lang / target_lang already set, nothing more to decide
-
+        pass
     else:
         # Case B: at least one of source/target is missing -> auto-detect source if needed
         if not source_lang:
+            detected_lang: str | None = None
             try:
+                # langdetect can be flaky on very short/noisy strings; still try, but don't fail hard.
                 detected_lang = detect(req.text)
             except LangDetectException:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Could not detect language of input text."
-                )
-            source_lang = detected_lang.lower()
+                LOG.warning("Language detection failed; defaulting source_lang to 'en'")
+
+            source_lang = (detected_lang or "en").lower()
             LOG.info("Auto-detected source language: %s", source_lang)
 
         # Decide target:
@@ -117,23 +112,26 @@ async def translate(req: TranslateRequest):
                 }
 
     # 3. Timing + translation using the *computed* languages
-    started_at = datetime.now().isoformat()
+    started_at = datetime.now(timezone.utc).isoformat()
     t0 = time.perf_counter()
 
     try:
-        out = chosen_model.translate(
-            req.text,
-            source_lang=source_lang,
-            target_lang=target_lang,
-            beam_size=1,
-        )
+        def _do_translate() -> str:
+            return chosen_model.translate(
+                req.text,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                beam_size=1,
+            )
+
+        out = await run_in_threadpool(_do_translate)
     except Exception as e:
         LOG.exception("Translation failed")
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
     # End timing
     t1 = time.perf_counter()
-    finished_at = datetime.now().isoformat()
+    finished_at = datetime.now(timezone.utc).isoformat()
     duration_seconds = t1 - t0
 
     # Log to console
@@ -158,4 +156,4 @@ async def translate(req: TranslateRequest):
 @app.get("/")
 async def root():
     # Simple health check / sanity check endpoint
-    return {"status": "ok", "model": "m2m_100_418M"}
+    return {"status": "ok", "default_model": DEFAULT_MODEL_NAME, "loaded_models": sorted(_MODEL_CACHE.keys())}
