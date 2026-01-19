@@ -1,0 +1,16 @@
+services:
+  um_translate:
+    container_name: um_translate
+    build:
+      context: .
+    image: ghcr.io/pranavnbapat/um_translate:latest
+    restart: always
+    environment:
+      - HF_HOME=/models
+    volumes:
+      - hf_cache:/models
+    env_file:
+      - .env
+
+volumes:
+  hf_cache:
